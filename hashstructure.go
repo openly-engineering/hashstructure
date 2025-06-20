@@ -11,10 +11,6 @@ import (
 
 // HashOptions are options that are available for hashing.
 type HashOptions struct {
-	// Hasher is the hash function to use. If this isn't set, it will
-	// default to FNV.
-	Hasher hash.Hash64
-
 	// TagName is the struct tag to look at when hashing the structure.
 	// By default this is "hash".
 	TagName string
@@ -47,10 +43,6 @@ const (
 	// To disallow the zero value
 	formatInvalid Format = iota
 
-	// FormatV1 is the format used in v1.x of this library. This has the
-	// downsides noted in issue #18 but allows simultaneous v1/v2 usage.
-	FormatV1
-
 	// FormatV2 is the current recommended format and fixes the issues
 	// noted in FormatV1.
 	FormatV2
@@ -61,9 +53,7 @@ const (
 // Hash returns the hash value of an arbitrary value.
 //
 // If opts is nil, then default options will be used. See HashOptions
-// for the default values. The same *HashOptions value cannot be used
-// concurrently. None of the values within a *HashOptions struct are
-// safe to read/write while hashing is being done.
+// for the default values.
 //
 // The "format" is required and must be one of the format values defined
 // by this library. You should probably just use "FormatV2". This allows
@@ -104,21 +94,17 @@ func Hash(v any, format Format, opts *HashOptions) (uint64, error) {
 	if opts == nil {
 		opts = &HashOptions{}
 	}
-	if opts.Hasher == nil {
-		opts.Hasher = fnv.New64()
-	}
-	if opts.TagName == "" {
-		opts.TagName = "hash"
-	}
 
-	// Reset the hash
-	opts.Hasher.Reset()
+	tagName := opts.TagName
+	if tagName == "" {
+		tagName = "hash"
+	}
 
 	// Create our walker and walk the structure
 	w := &walker{
 		format:          format,
-		h:               opts.Hasher,
-		tag:             opts.TagName,
+		h:               fnv.New64(),
+		tag:             tagName,
 		zeronil:         opts.ZeroNil,
 		ignorezerovalue: opts.IgnoreZeroValue,
 		sets:            opts.SlicesAsSets,
@@ -266,11 +252,8 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 			fieldHash := hashUpdateOrdered(w.h, kh, vh)
 			h = hashUpdateUnordered(h, fieldHash)
 		}
-
-		if w.format != FormatV1 {
-			// Important: read the docs for hashFinishUnordered
-			h = hashFinishUnordered(w.h, h)
-		}
+		// Important: read the docs for hashFinishUnordered
+		h = hashFinishUnordered(w.h, h)
 
 		return h, nil
 
@@ -374,10 +357,8 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 				h = hashUpdateUnordered(h, fieldHash)
 			}
 
-			if w.format != FormatV1 {
-				// Important: read the docs for hashFinishUnordered
-				h = hashFinishUnordered(w.h, h)
-			}
+			// Important: read the docs for hashFinishUnordered
+			h = hashFinishUnordered(w.h, h)
 		}
 
 		return h, nil
@@ -405,10 +386,8 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 			}
 		}
 
-		if set && w.format != FormatV1 {
-			// Important: read the docs for hashFinishUnordered
-			h = hashFinishUnordered(w.h, h)
-		}
+		// Important: read the docs for hashFinishUnordered
+		h = hashFinishUnordered(w.h, h)
 
 		return h, nil
 
