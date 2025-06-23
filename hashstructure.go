@@ -2,6 +2,7 @@ package hashstructure
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash"
 	"hash/fnv"
@@ -110,7 +111,8 @@ func Hash(v any, format Format, opts *HashOptions) (uint64, error) {
 		sets:            opts.SlicesAsSets,
 		stringer:        opts.UseStringer,
 	}
-	return w.visit(reflect.ValueOf(v), nil)
+	err := w.visit(reflect.ValueOf(v), nil)
+	return 0 /*TODO*/, err
 }
 
 type walker struct {
@@ -134,7 +136,8 @@ type visitOpts struct {
 
 var timeType = reflect.TypeOf(time.Time{})
 
-func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
+// visit visits a value recursively and updates w.h
+func (w *walker) visit(v reflect.Value, opts *visitOpts) error {
 	t := reflect.TypeOf(0)
 
 	// Loop since these can be wrapped in multiple layers of pointers
@@ -184,78 +187,75 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 	// We can shortcut numeric values by directly binary writing them
 	if k >= reflect.Int && k <= reflect.Complex64 {
 		// A direct hash calculation
-		w.h.Reset()
-		err := binary.Write(w.h, binary.LittleEndian, v.Interface())
-		return w.h.Sum64(), err
+		return binary.Write(w.h, binary.LittleEndian, v.Interface())
 	}
 
 	switch v.Type() {
 	case timeType:
-		w.h.Reset()
 		b, err := v.Interface().(time.Time).MarshalBinary()
 		if err != nil {
-			return 0, err
+			return err
 		}
 
 		err = binary.Write(w.h, binary.LittleEndian, b)
-		return w.h.Sum64(), err
+		return err
 	}
 
 	switch k {
 	case reflect.Array:
-		var h uint64
 		l := v.Len()
 		for i := 0; i < l; i++ {
-			current, err := w.visit(v.Index(i), nil)
+			err := w.visit(v.Index(i), nil)
 			if err != nil {
-				return 0, err
+				return err
 			}
 
-			h = hashUpdateOrdered(w.h, h, current)
 		}
-
-		return h, nil
+		return nil
 
 	case reflect.Map:
-		var includeMap IncludableMap
-		if opts != nil && opts.Struct != nil {
-			if v, ok := opts.Struct.(IncludableMap); ok {
-				includeMap = v
+		/*
+			var includeMap IncludableMap
+			if opts != nil && opts.Struct != nil {
+				if v, ok := opts.Struct.(IncludableMap); ok {
+					includeMap = v
+				}
 			}
-		}
 
-		// Build the hash for the map. We do this by XOR-ing all the key
-		// and value hashes. This makes it deterministic despite ordering.
-		var h uint64
-		for _, k := range v.MapKeys() {
-			v := v.MapIndex(k)
-			if includeMap != nil {
-				incl, err := includeMap.HashIncludeMap(
-					opts.StructField, k.Interface(), v.Interface())
+			// Build the hash for the map. We do this by XOR-ing all the key
+			// and value hashes. This makes it deterministic despite ordering.
+			var h uint64
+			for _, k := range v.MapKeys() {
+				v := v.MapIndex(k)
+				if includeMap != nil {
+					incl, err := includeMap.HashIncludeMap(
+						opts.StructField, k.Interface(), v.Interface())
+					if err != nil {
+						return 0, err
+					}
+					if !incl {
+						continue
+					}
+				}
+
+				kh, err := w.visit(k, nil)
 				if err != nil {
 					return 0, err
 				}
-				if !incl {
-					continue
+				vh, err := w.visit(v, nil)
+				if err != nil {
+					return 0, err
 				}
-			}
 
-			kh, err := w.visit(k, nil)
-			if err != nil {
-				return 0, err
+				fieldHash := hashUpdateOrdered(w.h, kh, vh)
+				h = hashUpdateUnordered(h, fieldHash)
 			}
-			vh, err := w.visit(v, nil)
-			if err != nil {
-				return 0, err
-			}
+			// Important: read the docs for hashFinishUnordered
+			h = hashFinishUnordered(w.h, h)
 
-			fieldHash := hashUpdateOrdered(w.h, kh, vh)
-			h = hashUpdateUnordered(h, fieldHash)
-		}
-		// Important: read the docs for hashFinishUnordered
-		h = hashFinishUnordered(w.h, h)
-
-		return h, nil
+			return h, nil
+		*/
+		return errors.New("map TODO")
 
 	case reflect.Struct:
 		parent := v.Interface()
@@ -265,7 +265,12 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 		}
 
 		if impl, ok := parent.(Hashable); ok {
-			return impl.Hash()
+			h, err := impl.Hash()
+			if err != nil {
+				return err
+			}
+			_, err = w.h.Write([]byte(fmt.Sprintf("%d", h)))
+			return err
 		}
 
 		// If we can address this value, check if the pointer value
@@ -278,14 +283,19 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 			}
 
 			if impl, ok := parentptr.(Hashable); ok {
-				return impl.Hash()
+				h, err := impl.Hash()
+				if err != nil {
+					return err
+				}
+				_, err = w.h.Write([]byte(fmt.Sprintf("%d", h)))
+				return err
 			}
 		}
 
 		t := v.Type()
-		h, err := w.visit(reflect.ValueOf(t.Name()), nil)
+		err := w.visit(reflect.ValueOf(t.Name()), nil)
 		if err != nil {
-			return 0, err
+			return err
 		}
 
 		l := v.NumField()
@@ -317,7 +327,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 					} else if tag == "string" {
 						// We only show this error if the tag explicitly
 						// requests a stringer.
-						return 0, &ErrNotStringer{
+						return &ErrNotStringer{
 							Field: v.Type().Field(i).Name,
 						}
 					}
@@ -327,7 +337,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 				if include != nil {
 					incl, err := include.HashInclude(fieldType.Name, innerV)
 					if err != nil {
-						return 0, err
+						return err
 					}
 					if !incl {
 						continue
@@ -339,116 +349,65 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 					f |= visitFlagSet
 				}
 
-				kh, err := w.visit(reflect.ValueOf(fieldType.Name), nil)
+				err := w.visit(reflect.ValueOf(fieldType.Name), nil)
 				if err != nil {
-					return 0, err
+					return err
 				}
 
-				vh, err := w.visit(innerV, &visitOpts{
+				err = w.visit(innerV, &visitOpts{
 					Flags:       f,
 					Struct:      parent,
 					StructField: fieldType.Name,
 				})
 				if err != nil {
+					return err
+				}
+
+			}
+
+		}
+
+		return nil
+
+	case reflect.Slice:
+		/*
+			// We have two behaviors here. If it isn't a set, then we just
+			// visit all the elements. If it is a set, then we do a deterministic
+			// hash code.
+			var h uint64
+			var set bool
+			if opts != nil {
+				set = (opts.Flags & visitFlagSet) != 0
+			}
+			l := v.Len()
+			for i := 0; i < l; i++ {
+				current, err := w.visit(v.Index(i), nil)
+				if err != nil {
 					return 0, err
 				}
 
-				fieldHash := hashUpdateOrdered(w.h, kh, vh)
-				h = hashUpdateUnordered(h, fieldHash)
+				if set || w.sets {
+					h = hashUpdateUnordered(h, current)
+				} else {
+					h = hashUpdateOrdered(w.h, h, current)
+				}
 			}
 
 			// Important: read the docs for hashFinishUnordered
 			h = hashFinishUnordered(w.h, h)
-		}
+		*/
 
-		return h, nil
-
-	case reflect.Slice:
-		// We have two behaviors here. If it isn't a set, then we just
-		// visit all the elements. If it is a set, then we do a deterministic
-		// hash code.
-		var h uint64
-		var set bool
-		if opts != nil {
-			set = (opts.Flags & visitFlagSet) != 0
-		}
-		l := v.Len()
-		for i := 0; i < l; i++ {
-			current, err := w.visit(v.Index(i), nil)
-			if err != nil {
-				return 0, err
-			}
-
-			if set || w.sets {
-				h = hashUpdateUnordered(h, current)
-			} else {
-				h = hashUpdateOrdered(w.h, h, current)
-			}
-		}
-
-		// Important: read the docs for hashFinishUnordered
-		h = hashFinishUnordered(w.h, h)
-
-		return h, nil
+		return errors.New("slice TODO")
 
 	case reflect.String:
 		// Directly hash
-		w.h.Reset()
 		_, err := w.h.Write([]byte(v.String()))
-		return w.h.Sum64(), err
+		return err
 
 	default:
-		return 0, fmt.Errorf("unknown kind to hash: %s", k)
+		return fmt.Errorf("unknown kind to hash: %s", k)
 	}
 
-}
-
-func hashUpdateOrdered(h hash.Hash64, a, b uint64) uint64 {
-	// For ordered updates, use a real hash function
-	h.Reset()
-
-	// We just panic if the binary writes fail because we are writing
-	// an int64 which should never be fail-able.
-	e1 := binary.Write(h, binary.LittleEndian, a)
-	e2 := binary.Write(h, binary.LittleEndian, b)
-	if e1 != nil {
-		panic(e1)
-	}
-	if e2 != nil {
-		panic(e2)
-	}
-
-	return h.Sum64()
-}
-
-func hashUpdateUnordered(a, b uint64) uint64 {
-	return a ^ b
-}
-
-// After mixing a group of unique hashes with hashUpdateUnordered, it's always
-// necessary to call hashFinishUnordered. Why? Because hashUpdateUnordered
-// is a simple XOR, and calling hashUpdateUnordered on hashes produced by
-// hashUpdateUnordered can effectively cancel out a previous change to the hash
-// result if the same hash value appears later on. For example, consider:
-//
-//	hashUpdateUnordered(hashUpdateUnordered("A", "B"), hashUpdateUnordered("A", "C")) =
-//	H("A") ^ H("B")) ^ (H("A") ^ H("C")) =
-//	(H("A") ^ H("A")) ^ (H("B") ^ H(C)) =
-//	H(B) ^ H(C) =
-//	hashUpdateUnordered(hashUpdateUnordered("Z", "B"), hashUpdateUnordered("Z", "C"))
-//
-// hashFinishUnordered "hardens" the result, so that encountering partially
-// overlapping input data later on in a different context won't cancel out.
-func hashFinishUnordered(h hash.Hash64, a uint64) uint64 {
-	h.Reset()
-
-	// We just panic if the writes fail
-	e1 := binary.Write(h, binary.LittleEndian, a)
-	if e1 != nil {
-		panic(e1)
-	}
-
-	return h.Sum64()
 }
 
 // visitFlag is used as a bitmask for affecting visit behavior
