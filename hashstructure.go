@@ -103,26 +103,21 @@ func Hash(v any, format Format, opts *HashOptions) (uint64, error) {
 
 	// Create our walker and walk the structure
 	w := &walker{
-		format:          format,
-		h:               fnv.New64(),
-		tag:             tagName,
-		zeronil:         opts.ZeroNil,
-		ignorezerovalue: opts.IgnoreZeroValue,
-		sets:            opts.SlicesAsSets,
-		stringer:        opts.UseStringer,
+		format: format,
+		h:      fnv.New64(),
+		tag:    tagName,
+		opts:   opts,
 	}
 	err := w.visit(reflect.ValueOf(v), nil)
 	return 0 /*TODO*/, err
 }
 
 type walker struct {
-	format          Format
-	h               hash.Hash64
-	tag             string
-	zeronil         bool
-	ignorezerovalue bool
-	sets            bool
-	stringer        bool
+	format Format
+	h      hash.Hash64
+	tag    string
+
+	opts *HashOptions
 }
 
 type visitOpts struct {
@@ -152,7 +147,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) error {
 		}
 
 		if v.Kind() == reflect.Ptr {
-			if w.zeronil {
+			if w.opts.ZeroNil {
 				t = v.Type().Elem()
 			}
 			v = reflect.Indirect(v)
@@ -214,48 +209,42 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) error {
 		return nil
 
 	case reflect.Map:
-		/*
-			var includeMap IncludableMap
-			if opts != nil && opts.Struct != nil {
-				if v, ok := opts.Struct.(IncludableMap); ok {
-					includeMap = v
+
+		var includeMap IncludableMap
+		if opts != nil && opts.Struct != nil {
+			if v, ok := opts.Struct.(IncludableMap); ok {
+				includeMap = v
+			}
+		}
+
+		// Build the hash for the map. We do this by XOR-ing all the key
+		// and value hashes. This makes it deterministic despite ordering.
+
+		for _, k := range v.MapKeys() {
+			v := v.MapIndex(k)
+			if includeMap != nil {
+				incl, err := includeMap.HashIncludeMap(
+					opts.StructField, k.Interface(), v.Interface())
+				if err != nil {
+					return err
+				}
+				if !incl {
+					continue
 				}
 			}
 
-			// Build the hash for the map. We do this by XOR-ing all the key
-			// and value hashes. This makes it deterministic despite ordering.
-			var h uint64
-			for _, k := range v.MapKeys() {
-				v := v.MapIndex(k)
-				if includeMap != nil {
-					incl, err := includeMap.HashIncludeMap(
-						opts.StructField, k.Interface(), v.Interface())
-					if err != nil {
-						return 0, err
-					}
-					if !incl {
-						continue
-					}
-				}
-
-				kh, err := w.visit(k, nil)
-				if err != nil {
-					return 0, err
-				}
-				vh, err := w.visit(v, nil)
-				if err != nil {
-					return 0, err
-				}
-
-				fieldHash := hashUpdateOrdered(w.h, kh, vh)
-				h = hashUpdateUnordered(h, fieldHash)
+			err := w.visit(k, nil)
+			if err != nil {
+				return err
 			}
-			// Important: read the docs for hashFinishUnordered
-			h = hashFinishUnordered(w.h, h)
+			err = w.visit(v, nil)
+			if err != nil {
+				return err
+			}
 
-			return h, nil
-		*/
-		return errors.New("map TODO")
+		}
+
+		return nil
 
 	case reflect.Struct:
 		parent := v.Interface()
@@ -314,14 +303,14 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) error {
 					continue
 				}
 
-				if w.ignorezerovalue {
+				if w.opts.IgnoreZeroValue {
 					if innerV.IsZero() {
 						continue
 					}
 				}
 
 				// if string is set, use the string value
-				if tag == "string" || w.stringer {
+				if tag == "string" || w.opts.UseStringer {
 					if impl, ok := innerV.Interface().(fmt.Stringer); ok {
 						innerV = reflect.ValueOf(impl.String())
 					} else if tag == "string" {
