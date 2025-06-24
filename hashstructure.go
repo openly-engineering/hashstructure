@@ -1,10 +1,11 @@
 package hashstructure
 
 import (
+	"bytes"
+	"crypto/md5"
 	"encoding/binary"
 	"fmt"
 	"hash"
-	"hash/fnv"
 	"reflect"
 	"sort"
 	"time"
@@ -44,9 +45,8 @@ const (
 	// To disallow the zero value
 	formatInvalid Format = iota
 
-	// FormatV2 is the current recommended format and fixes the issues
-	// noted in FormatV1.
-	FormatV2
+	// FormatMD5 uses the MD5 hasher.
+	FormatMD5
 
 	formatMax // so we can easily find the end
 )
@@ -85,10 +85,10 @@ const (
 //
 //   - "string" - The field will be hashed as a string, only works when the
 //     field implements fmt.Stringer
-func Hash(v any, format Format, opts *HashOptions) (uint64, error) {
+func Hash(v any, format Format, opts *HashOptions) ([]byte, error) {
 	// Validate our format
 	if format <= formatInvalid || format >= formatMax {
-		return 0, &ErrFormat{}
+		return nil, &ErrFormat{}
 	}
 
 	// Create default options
@@ -99,7 +99,7 @@ func Hash(v any, format Format, opts *HashOptions) (uint64, error) {
 	return hashValue(reflect.ValueOf(v), format, opts)
 }
 
-func hashValue(v reflect.Value, format Format, opts *HashOptions) (uint64, error) {
+func hashValue(v reflect.Value, format Format, opts *HashOptions) ([]byte, error) {
 	tagName := opts.TagName
 	if tagName == "" {
 		tagName = "hash"
@@ -108,17 +108,17 @@ func hashValue(v reflect.Value, format Format, opts *HashOptions) (uint64, error
 	// Create our walker and walk the structure
 	w := &walker{
 		format: format,
-		h:      fnv.New64(),
+		h:      md5.New(),
 		tag:    tagName,
 		opts:   opts,
 	}
 	err := w.visit(v, nil)
-	return 0 /*TODO*/, err
+	return w.h.Sum(nil), err
 }
 
 type walker struct {
 	format Format
-	h      hash.Hash64
+	h      hash.Hash
 	tag    string
 
 	opts *HashOptions
@@ -223,8 +223,8 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) error {
 		// and values. Then we sort the hashes, and finally, write the hashes
 		// in order to w.h to update the overall hash.
 		// This makes for a deterministic hash regardless of map traversal order.
-		keyHashes := make([]uint64, 0, v.Len())
-		valueHashes := make([]uint64, 0, v.Len())
+		keyHashes := make([][]byte, 0, v.Len())
+		valueHashes := make([][]byte, 0, v.Len())
 		for _, k := range v.MapKeys() {
 			v := v.MapIndex(k)
 			if includeMap != nil {
@@ -251,16 +251,16 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) error {
 		}
 
 		sort.Slice(keyHashes, func(i, j int) bool {
-			return keyHashes[i] < keyHashes[j]
+			return bytes.Compare(keyHashes[i], keyHashes[j]) < 0
 		})
 		sort.Slice(valueHashes, func(i, j int) bool {
-			return valueHashes[i] < valueHashes[j]
+			return bytes.Compare(valueHashes[i], valueHashes[j]) < 0
 		})
 		for _, h := range keyHashes {
-			fmt.Fprintf(w.h, "%d", h)
+			w.h.Write(h)
 		}
 		for _, h := range valueHashes {
-			fmt.Fprintf(w.h, "%d", h)
+			w.h.Write(h)
 		}
 
 		return nil
@@ -398,7 +398,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) error {
 			// First, hash each element, then sort the hashes
 			// and write them sequentially to w.h to update the overall hash.
 			// This leads to a deterministic hash for the slice regardless of element ordering.
-			hashes := make([]uint64, 0, l)
+			hashes := make([][]byte, 0, l)
 			for i := 0; i < l; i++ {
 				if h, err := hashValue(v.Index(i), w.format, w.opts); err != nil {
 					hashes = append(hashes, h)
@@ -407,7 +407,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) error {
 				}
 			}
 			sort.Slice(hashes, func(i, j int) bool {
-				return hashes[i] < hashes[j]
+				return bytes.Compare(hashes[i], hashes[j]) < 0
 			})
 			for _, h := range hashes {
 				fmt.Fprintf(w.h, "%d", h)

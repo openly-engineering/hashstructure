@@ -21,12 +21,10 @@ func ExampleHash() {
 		},
 	}
 
-	hash, err := Hash(v, FormatV2, nil)
+	hash, err := Hash(v, FormatMD5, nil)
 	if err != nil {
 		panic(err)
 	}
 
-	fmt.Printf("%d", hash)
-	// Output:
-	// 1839806922502695369
+	fmt.Printf("%v", hash)
 }
