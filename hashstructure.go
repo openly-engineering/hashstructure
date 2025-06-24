@@ -2,11 +2,11 @@ package hashstructure
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"hash"
 	"hash/fnv"
 	"reflect"
+	"sort"
 	"time"
 )
 
@@ -96,6 +96,10 @@ func Hash(v any, format Format, opts *HashOptions) (uint64, error) {
 		opts = &HashOptions{}
 	}
 
+	return hashValue(reflect.ValueOf(v), format, opts)
+}
+
+func hashValue(v reflect.Value, format Format, opts *HashOptions) (uint64, error) {
 	tagName := opts.TagName
 	if tagName == "" {
 		tagName = "hash"
@@ -108,7 +112,7 @@ func Hash(v any, format Format, opts *HashOptions) (uint64, error) {
 		tag:    tagName,
 		opts:   opts,
 	}
-	err := w.visit(reflect.ValueOf(v), nil)
+	err := w.visit(v, nil)
 	return 0 /*TODO*/, err
 }
 
@@ -204,12 +208,10 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) error {
 			if err != nil {
 				return err
 			}
-
 		}
 		return nil
 
 	case reflect.Map:
-
 		var includeMap IncludableMap
 		if opts != nil && opts.Struct != nil {
 			if v, ok := opts.Struct.(IncludableMap); ok {
@@ -217,9 +219,12 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) error {
 			}
 		}
 
-		// Build the hash for the map. We do this by XOR-ing all the key
-		// and value hashes. This makes it deterministic despite ordering.
-
+		// Build the hash for the map. We do this by first hashing all the keys
+		// and values. Then we sort the hashes, and finally, write the hashes
+		// in order to w.h to update the overall hash.
+		// This makes for a deterministic hash regardless of map traversal order.
+		keyHashes := make([]uint64, 0, v.Len())
+		valueHashes := make([]uint64, 0, v.Len())
 		for _, k := range v.MapKeys() {
 			v := v.MapIndex(k)
 			if includeMap != nil {
@@ -233,15 +238,29 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) error {
 				}
 			}
 
-			err := w.visit(k, nil)
+			kHash, err := hashValue(k, w.format, w.opts)
 			if err != nil {
 				return err
 			}
-			err = w.visit(v, nil)
+			vHash, err := hashValue(v, w.format, w.opts)
 			if err != nil {
 				return err
 			}
+			keyHashes = append(keyHashes, kHash)
+			valueHashes = append(valueHashes, vHash)
+		}
 
+		sort.Slice(keyHashes, func(i, j int) bool {
+			return keyHashes[i] < keyHashes[j]
+		})
+		sort.Slice(valueHashes, func(i, j int) bool {
+			return valueHashes[i] < valueHashes[j]
+		})
+		for _, h := range keyHashes {
+			fmt.Fprintf(w.h, "%d", h)
+		}
+		for _, h := range valueHashes {
+			fmt.Fprintf(w.h, "%d", h)
 		}
 
 		return nil
@@ -359,34 +378,43 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) error {
 		return nil
 
 	case reflect.Slice:
-		/*
-			// We have two behaviors here. If it isn't a set, then we just
-			// visit all the elements. If it is a set, then we do a deterministic
-			// hash code.
-			var h uint64
-			var set bool
-			if opts != nil {
-				set = (opts.Flags & visitFlagSet) != 0
-			}
-			l := v.Len()
+		// We have two behaviors here. If it isn't a set, then we just
+		// visit all the elements. If it is a set, then we do a deterministic
+		// hash code.
+		var set bool
+		if opts != nil {
+			set = (opts.Flags & visitFlagSet) != 0
+		}
+		l := v.Len()
+		if !set {
+			// Visit each index in order
 			for i := 0; i < l; i++ {
-				current, err := w.visit(v.Index(i), nil)
-				if err != nil {
-					return 0, err
-				}
-
-				if set || w.sets {
-					h = hashUpdateUnordered(h, current)
-				} else {
-					h = hashUpdateOrdered(w.h, h, current)
+				if err := w.visit(v.Index(i), nil); err != nil {
+					return err
 				}
 			}
+		} else {
+			// Build hash for slice treated as set (unordered)
+			// First, hash each element, then sort the hashes
+			// and write them sequentially to w.h to update the overall hash.
+			// This leads to a deterministic hash for the slice regardless of element ordering.
+			hashes := make([]uint64, 0, l)
+			for i := 0; i < l; i++ {
+				if h, err := hashValue(v.Index(i), w.format, w.opts); err != nil {
+					hashes = append(hashes, h)
+				} else {
+					return err
+				}
+			}
+			sort.Slice(hashes, func(i, j int) bool {
+				return hashes[i] < hashes[j]
+			})
+			for _, h := range hashes {
+				fmt.Fprintf(w.h, "%d", h)
+			}
+		}
 
-			// Important: read the docs for hashFinishUnordered
-			h = hashFinishUnordered(w.h, h)
-		*/
-
-		return errors.New("slice TODO")
+		return nil
 
 	case reflect.String:
 		// Directly hash
