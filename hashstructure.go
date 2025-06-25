@@ -124,7 +124,7 @@ type walker struct {
 	opts *HashOptions
 }
 
-type visitOpts struct {
+type visitCtx struct {
 	// Flags are a bitmask of flags to affect behavior of this visit
 	Flags visitFlag
 
@@ -136,7 +136,7 @@ type visitOpts struct {
 var timeType = reflect.TypeOf(time.Time{})
 
 // visit visits a value recursively and updates w.h
-func (w *walker) visit(v reflect.Value, opts *visitOpts) error {
+func (w *walker) visit(v reflect.Value, opts *visitCtx) error {
 	t := reflect.TypeOf(0)
 
 	// Loop since these can be wrapped in multiple layers of pointers
@@ -362,7 +362,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) error {
 					return err
 				}
 
-				err = w.visit(innerV, &visitOpts{
+				err = w.visit(innerV, &visitCtx{
 					Flags:       f,
 					Struct:      parent,
 					StructField: fieldType.Name,
