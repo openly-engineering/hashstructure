@@ -136,7 +136,7 @@ type visitCtx struct {
 var timeType = reflect.TypeOf(time.Time{})
 
 // visit visits a value recursively and updates w.h
-func (w *walker) visit(v reflect.Value, opts *visitCtx) error {
+func (w *walker) visit(v reflect.Value, ctx *visitCtx) error {
 	t := reflect.TypeOf(0)
 
 	// Loop since these can be wrapped in multiple layers of pointers
@@ -212,209 +212,13 @@ func (w *walker) visit(v reflect.Value, opts *visitCtx) error {
 		return nil
 
 	case reflect.Map:
-		var includeMap IncludableMap
-		if opts != nil && opts.Struct != nil {
-			if v, ok := opts.Struct.(IncludableMap); ok {
-				includeMap = v
-			}
-		}
-
-		// Build the hash for the map. We do this by first hashing all the keys
-		// and values. Then we sort the hashes, and finally, write the hashes
-		// in order to w.h to update the overall hash.
-		// This makes for a deterministic hash regardless of map traversal order.
-		keyHashes := make([][]byte, 0, v.Len())
-		valueHashes := make([][]byte, 0, v.Len())
-		for _, k := range v.MapKeys() {
-			v := v.MapIndex(k)
-			if includeMap != nil {
-				incl, err := includeMap.HashIncludeMap(
-					opts.StructField, k.Interface(), v.Interface())
-				if err != nil {
-					return err
-				}
-				if !incl {
-					continue
-				}
-			}
-
-			kHash, err := hashValue(k, w.format, w.opts)
-			if err != nil {
-				return err
-			}
-			vHash, err := hashValue(v, w.format, w.opts)
-			if err != nil {
-				return err
-			}
-			keyHashes = append(keyHashes, kHash)
-			valueHashes = append(valueHashes, vHash)
-		}
-
-		sort.Slice(keyHashes, func(i, j int) bool {
-			return bytes.Compare(keyHashes[i], keyHashes[j]) < 0
-		})
-		sort.Slice(valueHashes, func(i, j int) bool {
-			return bytes.Compare(valueHashes[i], valueHashes[j]) < 0
-		})
-		for _, h := range keyHashes {
-			w.h.Write(h)
-		}
-		for _, h := range valueHashes {
-			w.h.Write(h)
-		}
-
-		return nil
+		return w.visitMap(v, ctx)
 
 	case reflect.Struct:
-		parent := v.Interface()
-		var include Includable
-		if impl, ok := parent.(Includable); ok {
-			include = impl
-		}
-
-		if impl, ok := parent.(Hashable); ok {
-			h, err := impl.Hash()
-			if err != nil {
-				return err
-			}
-			_, err = w.h.Write([]byte(fmt.Sprintf("%d", h)))
-			return err
-		}
-
-		// If we can address this value, check if the pointer value
-		// implements our interfaces and use that if so.
-		if v.CanAddr() {
-			vptr := v.Addr()
-			parentptr := vptr.Interface()
-			if impl, ok := parentptr.(Includable); ok {
-				include = impl
-			}
-
-			if impl, ok := parentptr.(Hashable); ok {
-				h, err := impl.Hash()
-				if err != nil {
-					return err
-				}
-				_, err = w.h.Write([]byte(fmt.Sprintf("%d", h)))
-				return err
-			}
-		}
-
-		t := v.Type()
-		err := w.visit(reflect.ValueOf(t.Name()), nil)
-		if err != nil {
-			return err
-		}
-
-		l := v.NumField()
-		for i := 0; i < l; i++ {
-			if innerV := v.Field(i); v.CanSet() || t.Field(i).Name != "_" {
-				var f visitFlag
-				fieldType := t.Field(i)
-				if fieldType.PkgPath != "" {
-					// Unexported
-					continue
-				}
-
-				tag := fieldType.Tag.Get(w.tag)
-				if tag == "ignore" || tag == "-" {
-					// Ignore this field
-					continue
-				}
-
-				if w.opts.IgnoreZeroValue {
-					if innerV.IsZero() {
-						continue
-					}
-				}
-
-				// if string is set, use the string value
-				if tag == "string" || w.opts.UseStringer {
-					if impl, ok := innerV.Interface().(fmt.Stringer); ok {
-						innerV = reflect.ValueOf(impl.String())
-					} else if tag == "string" {
-						// We only show this error if the tag explicitly
-						// requests a stringer.
-						return &ErrNotStringer{
-							Field: v.Type().Field(i).Name,
-						}
-					}
-				}
-
-				// Check if we implement includable and check it
-				if include != nil {
-					incl, err := include.HashInclude(fieldType.Name, innerV)
-					if err != nil {
-						return err
-					}
-					if !incl {
-						continue
-					}
-				}
-
-				switch tag {
-				case "set":
-					f |= visitFlagSet
-				}
-
-				err := w.visit(reflect.ValueOf(fieldType.Name), nil)
-				if err != nil {
-					return err
-				}
-
-				err = w.visit(innerV, &visitCtx{
-					Flags:       f,
-					Struct:      parent,
-					StructField: fieldType.Name,
-				})
-				if err != nil {
-					return err
-				}
-
-			}
-
-		}
-
-		return nil
+		return w.visitStruct(v)
 
 	case reflect.Slice:
-		// We have two behaviors here. If it isn't a set, then we just
-		// visit all the elements. If it is a set, then we do a deterministic
-		// hash code.
-		var set bool
-		if opts != nil {
-			set = (opts.Flags & visitFlagSet) != 0
-		}
-		l := v.Len()
-		if !set {
-			// Visit each index in order
-			for i := 0; i < l; i++ {
-				if err := w.visit(v.Index(i), nil); err != nil {
-					return err
-				}
-			}
-		} else {
-			// Build hash for slice treated as set (unordered)
-			// First, hash each element, then sort the hashes
-			// and write them sequentially to w.h to update the overall hash.
-			// This leads to a deterministic hash for the slice regardless of element ordering.
-			hashes := make([][]byte, 0, l)
-			for i := 0; i < l; i++ {
-				if h, err := hashValue(v.Index(i), w.format, w.opts); err != nil {
-					hashes = append(hashes, h)
-				} else {
-					return err
-				}
-			}
-			sort.Slice(hashes, func(i, j int) bool {
-				return bytes.Compare(hashes[i], hashes[j]) < 0
-			})
-			for _, h := range hashes {
-				fmt.Fprintf(w.h, "%d", h)
-			}
-		}
-
-		return nil
+		return w.visitSlice(v, ctx)
 
 	case reflect.String:
 		// Directly hash
@@ -425,6 +229,214 @@ func (w *walker) visit(v reflect.Value, opts *visitCtx) error {
 		return fmt.Errorf("unknown kind to hash: %s", k)
 	}
 
+}
+
+func (w *walker) visitMap(v reflect.Value, opts *visitCtx) error {
+	var includeMap IncludableMap
+	if opts != nil && opts.Struct != nil {
+		if v, ok := opts.Struct.(IncludableMap); ok {
+			includeMap = v
+		}
+	}
+
+	// Build the hash for the map. We do this by first hashing all the keys
+	// and values. Then we sort the hashes, and finally, write the hashes
+	// in order to w.h to update the overall hash.
+	// This makes for a deterministic hash regardless of map traversal order.
+	keyHashes := make([][]byte, 0, v.Len())
+	valueHashes := make([][]byte, 0, v.Len())
+	for _, k := range v.MapKeys() {
+		v := v.MapIndex(k)
+		if includeMap != nil {
+			incl, err := includeMap.HashIncludeMap(
+				opts.StructField, k.Interface(), v.Interface())
+			if err != nil {
+				return err
+			}
+			if !incl {
+				continue
+			}
+		}
+
+		kHash, err := hashValue(k, w.format, w.opts)
+		if err != nil {
+			return err
+		}
+		vHash, err := hashValue(v, w.format, w.opts)
+		if err != nil {
+			return err
+		}
+		keyHashes = append(keyHashes, kHash)
+		valueHashes = append(valueHashes, vHash)
+	}
+
+	sort.Slice(keyHashes, func(i, j int) bool {
+		return bytes.Compare(keyHashes[i], keyHashes[j]) < 0
+	})
+	sort.Slice(valueHashes, func(i, j int) bool {
+		return bytes.Compare(valueHashes[i], valueHashes[j]) < 0
+	})
+	for _, h := range keyHashes {
+		w.h.Write(h)
+	}
+	for _, h := range valueHashes {
+		w.h.Write(h)
+	}
+
+	return nil
+}
+
+func (w *walker) visitStruct(v reflect.Value) error {
+	parent := v.Interface()
+	var include Includable
+	if impl, ok := parent.(Includable); ok {
+		include = impl
+	}
+
+	if impl, ok := parent.(Hashable); ok {
+		h, err := impl.Hash()
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(w.h, "%d", h)
+		return err
+	}
+
+	// If we can address this value, check if the pointer value
+	// implements our interfaces and use that if so.
+	if v.CanAddr() {
+		vptr := v.Addr()
+		parentptr := vptr.Interface()
+		if impl, ok := parentptr.(Includable); ok {
+			include = impl
+		}
+
+		if impl, ok := parentptr.(Hashable); ok {
+			h, err := impl.Hash()
+			if err != nil {
+				return err
+			}
+			_, err = w.h.Write([]byte(fmt.Sprintf("%d", h)))
+			return err
+		}
+	}
+
+	t := v.Type()
+	err := w.visit(reflect.ValueOf(t.Name()), nil)
+	if err != nil {
+		return err
+	}
+
+	l := v.NumField()
+	for i := 0; i < l; i++ {
+		if innerV := v.Field(i); v.CanSet() || t.Field(i).Name != "_" {
+			var f visitFlag
+			fieldType := t.Field(i)
+			if fieldType.PkgPath != "" {
+				// Unexported
+				continue
+			}
+
+			tag := fieldType.Tag.Get(w.tag)
+			if tag == "ignore" || tag == "-" {
+				// Ignore this field
+				continue
+			}
+
+			if w.opts.IgnoreZeroValue {
+				if innerV.IsZero() {
+					continue
+				}
+			}
+
+			// if string is set, use the string value
+			if tag == "string" || w.opts.UseStringer {
+				if impl, ok := innerV.Interface().(fmt.Stringer); ok {
+					innerV = reflect.ValueOf(impl.String())
+				} else if tag == "string" {
+					// We only show this error if the tag explicitly
+					// requests a stringer.
+					return &ErrNotStringer{
+						Field: v.Type().Field(i).Name,
+					}
+				}
+			}
+
+			// Check if we implement includable and check it
+			if include != nil {
+				incl, err := include.HashInclude(fieldType.Name, innerV)
+				if err != nil {
+					return err
+				}
+				if !incl {
+					continue
+				}
+			}
+
+			switch tag {
+			case "set":
+				f |= visitFlagSet
+			}
+
+			err := w.visit(reflect.ValueOf(fieldType.Name), nil)
+			if err != nil {
+				return err
+			}
+
+			err = w.visit(innerV, &visitCtx{
+				Flags:       f,
+				Struct:      parent,
+				StructField: fieldType.Name,
+			})
+			if err != nil {
+				return err
+			}
+
+		}
+
+	}
+
+	return nil
+}
+
+func (w *walker) visitSlice(v reflect.Value, ctx *visitCtx) error {
+	// We have two behaviors here. If it isn't a set, then we just
+	// visit all the elements. If it is a set, then we do a deterministic
+	// hash code.
+	var set bool
+	if ctx != nil {
+		set = (ctx.Flags & visitFlagSet) != 0
+	}
+	l := v.Len()
+	if !set {
+		// Visit each index in order
+		for i := 0; i < l; i++ {
+			if err := w.visit(v.Index(i), nil); err != nil {
+				return err
+			}
+		}
+	} else {
+		// Build hash for slice treated as set (unordered)
+		// First, hash each element, then sort the hashes
+		// and write them sequentially to w.h to update the overall hash.
+		// This leads to a deterministic hash for the slice regardless of element ordering.
+		hashes := make([][]byte, 0, l)
+		for i := 0; i < l; i++ {
+			if h, err := hashValue(v.Index(i), w.format, w.opts); err != nil {
+				hashes = append(hashes, h)
+			} else {
+				return err
+			}
+		}
+		sort.Slice(hashes, func(i, j int) bool {
+			return bytes.Compare(hashes[i], hashes[j]) < 0
+		})
+		for _, h := range hashes {
+			fmt.Fprintf(w.h, "%d", h)
+		}
+	}
+
+	return nil
 }
 
 // visitFlag is used as a bitmask for affecting visit behavior
