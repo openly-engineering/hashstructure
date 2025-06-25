@@ -1,20 +1,18 @@
 package hashstructure
 
 import (
+	"bytes"
+	"crypto/md5"
 	"encoding/binary"
 	"fmt"
 	"hash"
-	"hash/fnv"
 	"reflect"
+	"sort"
 	"time"
 )
 
 // HashOptions are options that are available for hashing.
 type HashOptions struct {
-	// Hasher is the hash function to use. If this isn't set, it will
-	// default to FNV.
-	Hasher hash.Hash64
-
 	// TagName is the struct tag to look at when hashing the structure.
 	// By default this is "hash".
 	TagName string
@@ -47,13 +45,8 @@ const (
 	// To disallow the zero value
 	formatInvalid Format = iota
 
-	// FormatV1 is the format used in v1.x of this library. This has the
-	// downsides noted in issue #18 but allows simultaneous v1/v2 usage.
-	FormatV1
-
-	// FormatV2 is the current recommended format and fixes the issues
-	// noted in FormatV1.
-	FormatV2
+	// FormatMD5 uses the MD5 hasher.
+	FormatMD5
 
 	formatMax // so we can easily find the end
 )
@@ -61,9 +54,7 @@ const (
 // Hash returns the hash value of an arbitrary value.
 //
 // If opts is nil, then default options will be used. See HashOptions
-// for the default values. The same *HashOptions value cannot be used
-// concurrently. None of the values within a *HashOptions struct are
-// safe to read/write while hashing is being done.
+// for the default values.
 //
 // The "format" is required and must be one of the format values defined
 // by this library. You should probably just use "FormatV2". This allows
@@ -72,84 +63,80 @@ const (
 //
 // Notes on the value:
 //
-//   * Unexported fields on structs are ignored and do not affect the
+//   - Unexported fields on structs are ignored and do not affect the
 //     hash value.
 //
-//   * Adding an exported field to a struct with the zero value will change
+//   - Adding an exported field to a struct with the zero value will change
 //     the hash value.
 //
 // For structs, the hashing can be controlled using tags. For example:
 //
-//    struct {
-//        Name string
-//        UUID string `hash:"ignore"`
-//    }
+//	struct {
+//	    Name string
+//	    UUID string `hash:"ignore"`
+//	}
 //
 // The available tag values are:
 //
-//   * "ignore" or "-" - The field will be ignored and not affect the hash code.
+//   - "ignore" or "-" - The field will be ignored and not affect the hash code.
 //
-//   * "set" - The field will be treated as a set, where ordering doesn't
-//             affect the hash code. This only works for slices.
+//   - "set" - The field will be treated as a set, where ordering doesn't
+//     affect the hash code. This only works for slices.
 //
-//   * "string" - The field will be hashed as a string, only works when the
-//                field implements fmt.Stringer
-//
-func Hash(v interface{}, format Format, opts *HashOptions) (uint64, error) {
+//   - "string" - The field will be hashed as a string, only works when the
+//     field implements fmt.Stringer
+func Hash(v any, format Format, opts *HashOptions) ([]byte, error) {
 	// Validate our format
 	if format <= formatInvalid || format >= formatMax {
-		return 0, &ErrFormat{}
+		return nil, &ErrFormat{}
 	}
 
 	// Create default options
 	if opts == nil {
 		opts = &HashOptions{}
 	}
-	if opts.Hasher == nil {
-		opts.Hasher = fnv.New64()
-	}
-	if opts.TagName == "" {
-		opts.TagName = "hash"
-	}
 
-	// Reset the hash
-	opts.Hasher.Reset()
+	return hashValue(reflect.ValueOf(v), format, opts)
+}
+
+func hashValue(v reflect.Value, format Format, opts *HashOptions) ([]byte, error) {
+	tagName := opts.TagName
+	if tagName == "" {
+		tagName = "hash"
+	}
 
 	// Create our walker and walk the structure
 	w := &walker{
-		format:          format,
-		h:               opts.Hasher,
-		tag:             opts.TagName,
-		zeronil:         opts.ZeroNil,
-		ignorezerovalue: opts.IgnoreZeroValue,
-		sets:            opts.SlicesAsSets,
-		stringer:        opts.UseStringer,
+		format: format,
+		h:      md5.New(),
+		tag:    tagName,
+		opts:   opts,
 	}
-	return w.visit(reflect.ValueOf(v), nil)
+	err := w.visit(v, nil)
+	return w.h.Sum(nil), err
 }
 
 type walker struct {
-	format          Format
-	h               hash.Hash64
-	tag             string
-	zeronil         bool
-	ignorezerovalue bool
-	sets            bool
-	stringer        bool
+	format Format
+	h      hash.Hash
+	tag    string
+
+	opts *HashOptions
 }
 
-type visitOpts struct {
+type visitCtx struct {
 	// Flags are a bitmask of flags to affect behavior of this visit
 	Flags visitFlag
 
 	// Information about the struct containing this field
-	Struct      interface{}
+	Struct      any
 	StructField string
 }
 
 var timeType = reflect.TypeOf(time.Time{})
 
-func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
+// visit visits a value recursively and updates w.h
+func (w *walker) visit(v reflect.Value, ctx *visitCtx) error {
 	t := reflect.TypeOf(0)
 
 	// Loop since these can be wrapped in multiple layers of pointers
@@ -164,7 +151,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 		}
 
 		if v.Kind() == reflect.Ptr {
-			if w.zeronil {
+			if w.opts.ZeroNil {
 				t = v.Type().Elem()
 			}
 			v = reflect.Indirect(v)
@@ -199,278 +186,257 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 	// We can shortcut numeric values by directly binary writing them
 	if k >= reflect.Int && k <= reflect.Complex64 {
 		// A direct hash calculation
-		w.h.Reset()
-		err := binary.Write(w.h, binary.LittleEndian, v.Interface())
-		return w.h.Sum64(), err
+		return binary.Write(w.h, binary.LittleEndian, v.Interface())
 	}
 
 	switch v.Type() {
 	case timeType:
-		w.h.Reset()
 		b, err := v.Interface().(time.Time).MarshalBinary()
 		if err != nil {
-			return 0, err
+			return err
 		}
 
 		err = binary.Write(w.h, binary.LittleEndian, b)
-		return w.h.Sum64(), err
+		return err
 	}
 
 	switch k {
 	case reflect.Array:
-		var h uint64
 		l := v.Len()
 		for i := 0; i < l; i++ {
-			current, err := w.visit(v.Index(i), nil)
+			err := w.visit(v.Index(i), nil)
 			if err != nil {
-				return 0, err
+				return err
 			}
-
-			h = hashUpdateOrdered(w.h, h, current)
 		}
-
-		return h, nil
+		return nil
 
 	case reflect.Map:
-		var includeMap IncludableMap
-		if opts != nil && opts.Struct != nil {
-			if v, ok := opts.Struct.(IncludableMap); ok {
-				includeMap = v
+		return w.visitMap(v, ctx)
+
+	case reflect.Struct:
+		return w.visitStruct(v)
+
+	case reflect.Slice:
+		return w.visitSlice(v, ctx)
+
+	case reflect.String:
+		// Directly hash
+		_, err := w.h.Write([]byte(v.String()))
+		return err
+
+	default:
+		return fmt.Errorf("unknown kind to hash: %s", k)
+	}
+
+}
+
+func (w *walker) visitMap(v reflect.Value, opts *visitCtx) error {
+	var includeMap IncludableMap
+	if opts != nil && opts.Struct != nil {
+		if v, ok := opts.Struct.(IncludableMap); ok {
+			includeMap = v
+		}
+	}
+
+	// Build the hash for the map. We do this by first hashing all the keys
+	// and values. Then we sort the hashes, and finally, write the hashes
+	// in order to w.h to update the overall hash.
+	// This makes for a deterministic hash regardless of map traversal order.
+	keyHashes := make([][]byte, 0, v.Len())
+	valueHashes := make([][]byte, 0, v.Len())
+	for _, k := range v.MapKeys() {
+		v := v.MapIndex(k)
+		if includeMap != nil {
+			incl, err := includeMap.HashIncludeMap(
+				opts.StructField, k.Interface(), v.Interface())
+			if err != nil {
+				return err
+			}
+			if !incl {
+				continue
 			}
 		}
 
-		// Build the hash for the map. We do this by XOR-ing all the key
-		// and value hashes. This makes it deterministic despite ordering.
-		var h uint64
-		for _, k := range v.MapKeys() {
-			v := v.MapIndex(k)
-			if includeMap != nil {
-				incl, err := includeMap.HashIncludeMap(
-					opts.StructField, k.Interface(), v.Interface())
+		kHash, err := hashValue(k, w.format, w.opts)
+		if err != nil {
+			return err
+		}
+		vHash, err := hashValue(v, w.format, w.opts)
+		if err != nil {
+			return err
+		}
+		keyHashes = append(keyHashes, kHash)
+		valueHashes = append(valueHashes, vHash)
+	}
+
+	sort.Slice(keyHashes, func(i, j int) bool {
+		return bytes.Compare(keyHashes[i], keyHashes[j]) < 0
+	})
+	sort.Slice(valueHashes, func(i, j int) bool {
+		return bytes.Compare(valueHashes[i], valueHashes[j]) < 0
+	})
+	for _, h := range keyHashes {
+		w.h.Write(h)
+	}
+	for _, h := range valueHashes {
+		w.h.Write(h)
+	}
+
+	return nil
+}
+
+func (w *walker) visitStruct(v reflect.Value) error {
+	parent := v.Interface()
+	var include Includable
+	if impl, ok := parent.(Includable); ok {
+		include = impl
+	}
+
+	if impl, ok := parent.(Hashable); ok {
+		h, err := impl.Hash()
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(w.h, "%d", h)
+		return err
+	}
+
+	// If we can address this value, check if the pointer value
+	// implements our interfaces and use that if so.
+	if v.CanAddr() {
+		vptr := v.Addr()
+		parentptr := vptr.Interface()
+		if impl, ok := parentptr.(Includable); ok {
+			include = impl
+		}
+
+		if impl, ok := parentptr.(Hashable); ok {
+			h, err := impl.Hash()
+			if err != nil {
+				return err
+			}
+			_, err = w.h.Write([]byte(fmt.Sprintf("%d", h)))
+			return err
+		}
+	}
+
+	t := v.Type()
+	err := w.visit(reflect.ValueOf(t.Name()), nil)
+	if err != nil {
+		return err
+	}
+
+	l := v.NumField()
+	for i := 0; i < l; i++ {
+		if innerV := v.Field(i); v.CanSet() || t.Field(i).Name != "_" {
+			var f visitFlag
+			fieldType := t.Field(i)
+			if fieldType.PkgPath != "" {
+				// Unexported
+				continue
+			}
+
+			tag := fieldType.Tag.Get(w.tag)
+			if tag == "ignore" || tag == "-" {
+				// Ignore this field
+				continue
+			}
+
+			if w.opts.IgnoreZeroValue {
+				if innerV.IsZero() {
+					continue
+				}
+			}
+
+			// if string is set, use the string value
+			if tag == "string" || w.opts.UseStringer {
+				if impl, ok := innerV.Interface().(fmt.Stringer); ok {
+					innerV = reflect.ValueOf(impl.String())
+				} else if tag == "string" {
+					// We only show this error if the tag explicitly
+					// requests a stringer.
+					return &ErrNotStringer{
+						Field: v.Type().Field(i).Name,
+					}
+				}
+			}
+
+			// Check if we implement includable and check it
+			if include != nil {
+				incl, err := include.HashInclude(fieldType.Name, innerV)
 				if err != nil {
-					return 0, err
+					return err
 				}
 				if !incl {
 					continue
 				}
 			}
 
-			kh, err := w.visit(k, nil)
+			switch tag {
+			case "set":
+				f |= visitFlagSet
+			}
+
+			err := w.visit(reflect.ValueOf(fieldType.Name), nil)
 			if err != nil {
-				return 0, err
+				return err
 			}
-			vh, err := w.visit(v, nil)
+
+			err = w.visit(innerV, &visitCtx{
+				Flags:       f,
+				Struct:      parent,
+				StructField: fieldType.Name,
+			})
 			if err != nil {
-				return 0, err
+				return err
 			}
 
-			fieldHash := hashUpdateOrdered(w.h, kh, vh)
-			h = hashUpdateUnordered(h, fieldHash)
 		}
 
-		if w.format != FormatV1 {
-			// Important: read the docs for hashFinishUnordered
-			h = hashFinishUnordered(w.h, h)
-		}
+	}
 
-		return h, nil
+	return nil
+}
 
-	case reflect.Struct:
-		parent := v.Interface()
-		var include Includable
-		if impl, ok := parent.(Includable); ok {
-			include = impl
-		}
-
-		if impl, ok := parent.(Hashable); ok {
-			return impl.Hash()
-		}
-
-		// If we can address this value, check if the pointer value
-		// implements our interfaces and use that if so.
-		if v.CanAddr() {
-			vptr := v.Addr()
-			parentptr := vptr.Interface()
-			if impl, ok := parentptr.(Includable); ok {
-				include = impl
-			}
-
-			if impl, ok := parentptr.(Hashable); ok {
-				return impl.Hash()
-			}
-		}
-
-		t := v.Type()
-		h, err := w.visit(reflect.ValueOf(t.Name()), nil)
-		if err != nil {
-			return 0, err
-		}
-
-		l := v.NumField()
+func (w *walker) visitSlice(v reflect.Value, ctx *visitCtx) error {
+	// We have two behaviors here. If it isn't a set, then we just
+	// visit all the elements. If it is a set, then we do a deterministic
+	// hash code.
+	var set bool
+	if ctx != nil {
+		set = (ctx.Flags & visitFlagSet) != 0
+	}
+	l := v.Len()
+	if !set {
+		// Visit each index in order
 		for i := 0; i < l; i++ {
-			if innerV := v.Field(i); v.CanSet() || t.Field(i).Name != "_" {
-				var f visitFlag
-				fieldType := t.Field(i)
-				if fieldType.PkgPath != "" {
-					// Unexported
-					continue
-				}
-
-				tag := fieldType.Tag.Get(w.tag)
-				if tag == "ignore" || tag == "-" {
-					// Ignore this field
-					continue
-				}
-
-				if w.ignorezerovalue {
-					if innerV.IsZero() {
-						continue
-					}
-				}
-
-				// if string is set, use the string value
-				if tag == "string" || w.stringer {
-					if impl, ok := innerV.Interface().(fmt.Stringer); ok {
-						innerV = reflect.ValueOf(impl.String())
-					} else if tag == "string" {
-						// We only show this error if the tag explicitly
-						// requests a stringer.
-						return 0, &ErrNotStringer{
-							Field: v.Type().Field(i).Name,
-						}
-					}
-				}
-
-				// Check if we implement includable and check it
-				if include != nil {
-					incl, err := include.HashInclude(fieldType.Name, innerV)
-					if err != nil {
-						return 0, err
-					}
-					if !incl {
-						continue
-					}
-				}
-
-				switch tag {
-				case "set":
-					f |= visitFlagSet
-				}
-
-				kh, err := w.visit(reflect.ValueOf(fieldType.Name), nil)
-				if err != nil {
-					return 0, err
-				}
-
-				vh, err := w.visit(innerV, &visitOpts{
-					Flags:       f,
-					Struct:      parent,
-					StructField: fieldType.Name,
-				})
-				if err != nil {
-					return 0, err
-				}
-
-				fieldHash := hashUpdateOrdered(w.h, kh, vh)
-				h = hashUpdateUnordered(h, fieldHash)
-			}
-
-			if w.format != FormatV1 {
-				// Important: read the docs for hashFinishUnordered
-				h = hashFinishUnordered(w.h, h)
+			if err := w.visit(v.Index(i), nil); err != nil {
+				return err
 			}
 		}
-
-		return h, nil
-
-	case reflect.Slice:
-		// We have two behaviors here. If it isn't a set, then we just
-		// visit all the elements. If it is a set, then we do a deterministic
-		// hash code.
-		var h uint64
-		var set bool
-		if opts != nil {
-			set = (opts.Flags & visitFlagSet) != 0
-		}
-		l := v.Len()
+	} else {
+		// Build hash for slice treated as set (unordered)
+		// First, hash each element, then sort the hashes
+		// and write them sequentially to w.h to update the overall hash.
+		// This leads to a deterministic hash for the slice regardless of element ordering.
+		hashes := make([][]byte, 0, l)
 		for i := 0; i < l; i++ {
-			current, err := w.visit(v.Index(i), nil)
-			if err != nil {
-				return 0, err
-			}
-
-			if set || w.sets {
-				h = hashUpdateUnordered(h, current)
+			if h, err := hashValue(v.Index(i), w.format, w.opts); err != nil {
+				hashes = append(hashes, h)
 			} else {
-				h = hashUpdateOrdered(w.h, h, current)
+				return err
 			}
 		}
-
-		if set && w.format != FormatV1 {
-			// Important: read the docs for hashFinishUnordered
-			h = hashFinishUnordered(w.h, h)
+		sort.Slice(hashes, func(i, j int) bool {
+			return bytes.Compare(hashes[i], hashes[j]) < 0
+		})
+		for _, h := range hashes {
+			fmt.Fprintf(w.h, "%d", h)
 		}
-
-		return h, nil
-
-	case reflect.String:
-		// Directly hash
-		w.h.Reset()
-		_, err := w.h.Write([]byte(v.String()))
-		return w.h.Sum64(), err
-
-	default:
-		return 0, fmt.Errorf("unknown kind to hash: %s", k)
 	}
 
-}
-
-func hashUpdateOrdered(h hash.Hash64, a, b uint64) uint64 {
-	// For ordered updates, use a real hash function
-	h.Reset()
-
-	// We just panic if the binary writes fail because we are writing
-	// an int64 which should never be fail-able.
-	e1 := binary.Write(h, binary.LittleEndian, a)
-	e2 := binary.Write(h, binary.LittleEndian, b)
-	if e1 != nil {
-		panic(e1)
-	}
-	if e2 != nil {
-		panic(e2)
-	}
-
-	return h.Sum64()
-}
-
-func hashUpdateUnordered(a, b uint64) uint64 {
-	return a ^ b
-}
-
-// After mixing a group of unique hashes with hashUpdateUnordered, it's always
-// necessary to call hashFinishUnordered. Why? Because hashUpdateUnordered
-// is a simple XOR, and calling hashUpdateUnordered on hashes produced by
-// hashUpdateUnordered can effectively cancel out a previous change to the hash
-// result if the same hash value appears later on. For example, consider:
-//
-//   hashUpdateUnordered(hashUpdateUnordered("A", "B"), hashUpdateUnordered("A", "C")) =
-//   H("A") ^ H("B")) ^ (H("A") ^ H("C")) =
-//   (H("A") ^ H("A")) ^ (H("B") ^ H(C)) =
-//   H(B) ^ H(C) =
-//   hashUpdateUnordered(hashUpdateUnordered("Z", "B"), hashUpdateUnordered("Z", "C"))
-//
-// hashFinishUnordered "hardens" the result, so that encountering partially
-// overlapping input data later on in a different context won't cancel out.
-func hashFinishUnordered(h hash.Hash64, a uint64) uint64 {
-	h.Reset()
-
-	// We just panic if the writes fail
-	e1 := binary.Write(h, binary.LittleEndian, a)
-	if e1 != nil {
-		panic(e1)
-	}
-
-	return h.Sum64()
+	return nil
 }
 
 // visitFlag is used as a bitmask for affecting visit behavior
