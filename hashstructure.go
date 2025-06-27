@@ -322,6 +322,13 @@ func (w *walker) visitStruct(v reflect.Value) error {
 	}
 
 	t := v.Type()
+
+	// we need to "unbox" the value in an optional struct
+	// becuase the actual value is a private field
+	if t.PkgPath() == "github.com/markphelps/optional" {
+		return w.visitOptional(v, t.Name())
+	}
+
 	err := w.visit(reflect.ValueOf(t.Name()), nil)
 	if err != nil {
 		return err
