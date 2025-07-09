@@ -1,0 +1,11 @@
+name: wiz scanning
+on:
+  pull_request:
+jobs:
+  wiz_sast_reusable_workflow:
+    uses: openly-security/infrastructure/.github/workflows/wiz-sast.yml@main
+    secrets: inherit
+  wiz_iac_reusable_workflow:
+    uses: openly-security/infrastructure/.github/workflows/wiz-iac.yml@main
+    secrets: inherit
+
